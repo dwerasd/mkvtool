@@ -3,6 +3,7 @@
 
 사용 흐름:
     1. 경로 입력(직접 입력 또는 찾아보기) 후 [미리보기] — 변경 대상을 로그에 표시.
+       요약에 mkv변환 대상(비-MKV 영상/변환 가능 수) 현황도 함께 표기한다.
     2. [적용] — 미리보기에서 확정된 목록을 실제로 반영.
     3. 경로를 수정하면 기존 미리보기 결과는 무효화되어 [적용]이 비활성화되고,
        다시 [미리보기]를 눌러야 한다(새 경로 기준으로 재스캔).
@@ -261,6 +262,12 @@ class Worker(QThread):
             f"\n[요약] 변경예정 {len(plan)} / 유지 {kept}"
             f" / 패턴불일치 {unparsed} / 충돌 {conflict}"
         )
+        # mkv변환 대상 현황도 함께 보고(미리보기가 정찰 단계 — 합치기 전 판단용)
+        remux = [p for p in files if p.suffix.lower() in REMUX_EXTS]
+        if remux:
+            n_conv = sum(1 for p in remux if not p.with_suffix(".mkv").exists())
+            self.line.emit(f"[mkv변환 대상] 비-MKV 영상 {len(remux)}개"
+                           f" / 변환 가능 {n_conv}개(나머지는 mkv 이미 존재)")
         return plan
 
     def _smi(self) -> None:
@@ -734,6 +741,11 @@ class Worker(QThread):
                 continue
             seen.add(key)
             run.append(src)
+        # 실행 전 사전점검: 변환 가능 수를 먼저 보고한다(첫 파일 변환이 끝날
+        # 때까지 로그가 없는 NAS 배치에서 헤더만 뜬 채 침묵하는 것을 방지)
+        n_skip = sum(1 for s in run if s.with_suffix(".mkv").exists())
+        self.line.emit(f"[사전점검] 변환 가능 {len(run) - n_skip}개"
+                       f" / 이미 mkv 존재 {n_skip}개(스킵 예정)")
         for state, lines in self._iter_results(run, self._remux_one):
             for ln in lines:
                 self.line.emit(ln)
