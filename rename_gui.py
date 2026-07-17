@@ -29,8 +29,8 @@
        선택 언어의 자막은 보존하고 그 외 전부 제거한다. ko 기본트랙 규칙:
        ko 자막이 기본이 아니면 전체 기본 해제 후 ko(2개면 첫번째)를 기본으로,
        ko 가 3개 이상이면 해당 파일은 알리고 진행하지 않는다(보류).
-    7. 옵션(최상위/시즌제거/원본제거 체크/합치기 모드)과 마지막 사용 경로는
-       QSettings 로 영속되어 재실행 시 복원된다.
+    7. 옵션(최상위/시즌제거/원본제거 체크/합치기 모드)·마지막 사용 경로·
+       창 위치/크기는 QSettings 로 영속되어 재실행 시 복원된다.
     8. [중지] 버튼(실행 중에만 활성) 또는 창 닫기(X)는 작업을 즉시 중단한다:
        실행 중 mkvmerge 를 종료하고 임시 파일을 삭제하며 원본은 보존한다.
     9. [자막변환]/[합치기]/[합치기 테스트] 완료 시 알림 창을 띄운다. 창이
@@ -874,6 +874,11 @@ class MainWindow(QWidget):
 
         # 옵션 영속화: 저장값 복원(복원 중 시그널이 같은 값을 재저장해도 무해)
         self.settings = QSettings("mkvtoolnix", "rename_gui")
+        # 창 위치/크기 복원은 show 전에 — 최상위 복원이 show 를 먼저 부르면
+        # 기본 위치로 떴다가 이동하는 점프가 보인다
+        geo = self.settings.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
         self.chk_del.toggled.connect(
             lambda on: self.settings.setValue("delete_smi", on))
         self.chk_del.setChecked(bool(self.settings.value("delete_smi", True, type=bool)))
@@ -939,6 +944,7 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """창을 닫으면 진행 중 작업을 중단하고 정리가 끝난 뒤 종료한다."""
+        self.settings.setValue("geometry", self.saveGeometry())
         if self.worker is not None and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(10_000)  # 현재 파일 정리(임시 삭제)까지 대기
