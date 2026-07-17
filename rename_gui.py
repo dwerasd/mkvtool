@@ -16,7 +16,9 @@
        [mkv변환] 비-MKV 영상(.mp4/.avi/.ts/.wmv/.mov)을 조건 없이 MKV 컨테이너로
          변환한다(트랙 전체 보존, 검증 후 원본 컨테이너 제거). 이하 모드는 .mkv 대상:
        [기본해제+ko추가] 기존 자막 기본 플래그 전부 해제 + 같은 이름 .srt 를
-         ko 기본 자막으로 추가. [자막제거+ko추가] 기존 자막 전부 제거 + ko 추가.
+         ko 기본 자막으로 추가. [자막제거+ko추가] 기존 자막 전부 제거 + ko 추가 —
+         이 모드만 같은 이름 .srt 가 있는 비-MKV 영상도 대상에 포함해 .mkv 로
+         변환하며 합친다(mkv변환+합치기 겸용, 검증 후 원본 컨테이너 제거).
        [자막제거] 자막 트랙만 제거(del_sup.py 와 동일, 용량 절감 보고).
        공통: 임시 파일로 만든 뒤 트랙 구성을 검증하고 원본을 원자 교체한다.
        목표 상태가 이미 달성된 파일은 스킵한다(재실행 안전). .srt 원본은 남긴다.
@@ -310,28 +312,37 @@ class Worker(QThread):
         tail = f" / 원본제거 {deleted}" if self.delete_smi else ""
         self.line.emit(f"\n[요약] 변환 {done} / 스킵(srt존재) {skipped} / 실패 {failed}{tail}")
 
-    def _mux_one(self, mkv: Path) -> tuple[str, list[str]]:
-        """단일 mkv 에 ko 자막을 합친다. (상태, 로그라인) 반환 — 병렬 실행 안전."""
+    def _mux_one(self, src: Path) -> tuple[str, list[str]]:
+        """단일 영상에 ko 자막을 합친다. (상태, 로그라인) 반환 — 병렬 실행 안전.
+
+        자막제거+ko추가 모드는 비-MKV 영상(REMUX_EXTS)도 받아 .mkv 로 변환하며 합친다.
+        """
         lines: list[str] = []
         if self._cancel:
             return "cancel", lines
-        srt = mkv.with_suffix(".srt")
+        srt = src.with_suffix(".srt")
         if not srt.exists():
             if not self.mux_test:
-                lines.append(f"  [스킵] {mkv.name}: 같은 이름의 .srt 없음")
+                lines.append(f"  [스킵] {src.name}: 같은 이름의 .srt 없음")
             return "skip", lines
         try:
-            state = self._mux_body(mkv, srt, lines)
+            state = self._mux_body(src, srt, lines)
         except OSError as e:
-            lines.append(f"  [실패] {mkv.name}: {e}")
+            lines.append(f"  [실패] {src.name}: {e}")
             state = "fail"
         return state, lines
 
-    def _mux_body(self, mkv: Path, srt: Path, lines: list[str]) -> str:
+    def _mux_body(self, src: Path, srt: Path, lines: list[str]) -> str:
         t0 = time.monotonic()
-        info = self._probe_cached(mkv)
+        remux = src.suffix.lower() != ".mkv"  # 비-MKV 소스: 변환+합치기 동시 수행
+        dst = src.with_suffix(".mkv")
+        if remux and dst.exists():
+            if not self.mux_test:
+                lines.append(f"  [스킵] {src.name}: {dst.name} 이미 존재")
+            return "skip"
+        info = self._probe_cached(src)
         if info is None:
-            lines.append(f"  [검사실패] {mkv.name}")
+            lines.append(f"  [검사실패] {src.name}")
             return "fail"
         tracks = info.get("tracks", [])
         subs = [t for t in tracks if t.get("type") == "subtitles"]
@@ -346,22 +357,23 @@ class Worker(QThread):
             keep = [t for t in subs if sub_lang(t) in self.keep_langs]
             ko_kept = [t for t in keep if sub_lang(t) == "ko"]
             if len(ko_kept) >= 3:
-                lines.append(f"  [보류] {mkv.name}: ko 자막 {len(ko_kept)}개 —"
+                lines.append(f"  [보류] {src.name}: ko 자막 {len(ko_kept)}개 —"
                              f" 수동 확인 필요, 진행하지 않음")
                 return "skip"
-        # 목표 상태 달성 시 스킵: 옵션1 은 ko 기본 존재, 옵션2 는 ko 기본 단독
+        # 목표 상태 달성 시 스킵(비-MKV 는 컨테이너 변환이 남아 항상 진행):
+        # 옵션1 은 ko 기본 존재, 옵션2 는 ko 기본 단독
         # (남길 자막 지정 시: ko 기본 존재 + 모든 자막이 남길 언어(∪ko) 안)
-        if ko_default:
+        if ko_default and not remux:
             if not self.mux_strip:
-                lines.append(f"  [스킵] {mkv.name}: 이미 ko 기본 자막 있음")
+                lines.append(f"  [스킵] {src.name}: 이미 ko 기본 자막 있음")
                 return "skip"
             allowed = set(self.keep_langs) | {"ko"}
             if (self.keep_langs and all(sub_lang(t) in allowed for t in subs)) \
                     or (not self.keep_langs and len(subs) == 1):
-                lines.append(f"  [스킵] {mkv.name}: 이미 ko 기본 자막 있음")
+                lines.append(f"  [스킵] {src.name}: 이미 ko 기본 자막 있음")
                 return "skip"
 
-        tmp = mkv.with_name(mkv.stem + MUX_TMP_SUFFIX)
+        tmp = src.with_name(src.stem + MUX_TMP_SUFFIX)
         if tmp.exists():
             tmp.unlink()
         cmd = [str(MKVMERGE), "-o", str(tmp)]
@@ -375,23 +387,23 @@ class Worker(QThread):
         else:
             for t in subs:
                 cmd += ["--default-track-flag", f"{t['id']}:0"]
-        cmd += [str(mkv), "--language", "0:ko", "--default-track-flag", "0:1", str(srt)]
+        cmd += [str(src), "--language", "0:ko", "--default-track-flag", "0:1", str(srt)]
         proc = self._run_mkvmerge(cmd)
         if self._cancel:
             if tmp.exists():
                 tmp.unlink()
-            lines.append(f"  [중단] {mkv.name}: 원본 보존, 임시 파일 삭제")
+            lines.append(f"  [중단] {src.name}: 원본 보존, 임시 파일 삭제")
             return "cancel"
         if proc.returncode == 2 or not tmp.exists():
             err = (proc.stderr or proc.stdout or "").strip()[:300]
-            lines.append(f"  [합치기실패] {mkv.name}: {err}")
+            lines.append(f"  [합치기실패] {src.name}: {err}")
             if tmp.exists():
                 tmp.unlink()
             return "fail"
 
         # 출력 검증은 의심 경로에서만: rc=1(경고) 또는 출력 크기 이상 시 풀 검증.
         # rc=0 + 크기 정상은 신뢰한다(수백~수천 파일 배치의 프로브 비용 절감).
-        if proc.returncode != 0 or tmp.stat().st_size < mkv.stat().st_size * 0.5:
+        if proc.returncode != 0 or tmp.stat().st_size < src.stat().st_size * 0.5:
             out = probe(tmp)
             ok = False
             if out is not None:
@@ -410,26 +422,36 @@ class Worker(QThread):
                     and len(ko_def) == 1 and not other_def
                 )
             if not ok:
-                lines.append(f"  [검증실패] {mkv.name}: 원본 보존, 임시 파일 삭제")
+                lines.append(f"  [검증실패] {src.name}: 원본 보존, 임시 파일 삭제")
                 tmp.unlink()
                 return "fail"
 
         if self.mux_strip:
-            detail = (f"자막 {len(subs) - len(keep)}개 제거·{len(keep)}개 유지"
-                      if keep else "기존 자막 제거")
+            if keep:
+                detail = f"자막 {len(subs) - len(keep)}개 제거·{len(keep)}개 유지"
+            else:
+                detail = "기존 자막 제거" if subs else "기존 자막 없음"
         else:
             detail = f"기존 자막 {len(subs)}개 기본해제"
         elapsed = format_elapsed(time.monotonic() - t0)
         if self.mux_test:
-            dst = mkv.with_name(mkv.stem + MUX_TEST_SUFFIX)
-            if dst.exists():
-                dst.unlink()
+            dst_test = src.with_name(src.stem + MUX_TEST_SUFFIX)
+            if dst_test.exists():
+                dst_test.unlink()
+            tmp.replace(dst_test)
+            lines.append(f"  [테스트완료] {src.name}: {detail}, ko 자막 추가(기본)"
+                         f" ({elapsed})\n      → {dst_test.name} (원본 유지)")
+        elif remux:
             tmp.replace(dst)
-            lines.append(f"  [테스트완료] {mkv.name}: {detail}, ko 자막 추가(기본)"
-                         f" ({elapsed})\n      → {dst.name} (원본 유지)")
+            try:
+                src.unlink()  # 검증 통과한 .mkv 가 자리잡은 뒤 원본 컨테이너 제거
+            except OSError as e:
+                lines.append(f"  [경고] {src.name}: 원본 제거 실패 — {e}")
+            lines.append(f"  [완료] {src.name} → {dst.name}: {detail},"
+                         f" ko 자막 추가(기본) ({elapsed})")
         else:
-            tmp.replace(mkv)
-            lines.append(f"  [완료] {mkv.name}: {detail}, ko 자막 추가(기본) ({elapsed})")
+            tmp.replace(src)
+            lines.append(f"  [완료] {src.name}: {detail}, ko 자막 추가(기본) ({elapsed})")
         return "done"
 
     def _iter_results(self, files, one):
@@ -464,8 +486,11 @@ class Worker(QThread):
             self.line.emit(f"[오류] mkvmerge.exe 를 찾을 수 없음: {MKVMERGE}")
             return
         done = skipped = failed = 0
-        files = sorted(p for p in self.root.rglob("*.mkv")
-                       if not p.name.endswith(MUX_TMP_SUFFIX)
+        # 자막제거+ko추가는 비-MKV 영상도 대상(결과가 .mkv 라 mkv변환+합치기 겸용)
+        exts = {".mkv"} | (REMUX_EXTS if self.mux_strip else set())
+        files = sorted(p for p in self.root.rglob("*")
+                       if p.is_file() and p.suffix.lower() in exts
+                       and not p.name.endswith(MUX_TMP_SUFFIX)
                        and not p.name.endswith(MUX_TEST_SUFFIX))
         mode = "자막제거+ko추가" if self.mux_strip else "기본해제+ko추가"
         if self.mux_strip and self.keep_langs:
@@ -473,8 +498,27 @@ class Worker(QThread):
         tag = " 테스트(1개만, 원본 유지)" if self.mux_test else ""
         jobs = f" (동시 {self.jobs})" if self.jobs > 1 and not self.mux_test else ""
         started = time.monotonic()
-        self.line.emit(f"[자막합치기:{mode}{tag}] {self.root} — MKV {len(files)}개{jobs}")
-        for state, lines in self._iter_results(files, self._mux_one):
+        n_conv = sum(1 for p in files if p.suffix.lower() != ".mkv")
+        head = f"MKV {len(files) - n_conv}개"
+        if self.mux_strip:
+            head += f" + 비-MKV {n_conv}개(mkv 변환 겸)"
+        self.line.emit(f"[자막합치기:{mode}{tag}] {self.root} — {head}{jobs}")
+        # 같은 스템의 비-MKV 둘(A.mp4+A.ts)이 같은 A.mkv 를 두고 경쟁하지 않도록
+        # 배치 내 변환 대상명이 중복되면 뒤의 것을 충돌로 제외한다
+        run: list[Path] = []
+        seen: set[str] = set()
+        for p in files:
+            if p.suffix.lower() == ".mkv":
+                run.append(p)
+                continue
+            key = str(p.with_suffix(".mkv")).lower()
+            if key in seen:
+                self.line.emit(f"  [충돌] {p.name}: 변환 대상명이 배치 내 중복")
+                failed += 1
+                continue
+            seen.add(key)
+            run.append(p)
+        for state, lines in self._iter_results(run, self._mux_one):
             for ln in lines:
                 self.line.emit(ln)
             if state == "done":
