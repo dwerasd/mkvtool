@@ -33,6 +33,9 @@
        QSettings 로 영속되어 재실행 시 복원된다.
     8. [중지] 버튼(실행 중에만 활성) 또는 창 닫기(X)는 작업을 즉시 중단한다:
        실행 중 mkvmerge 를 종료하고 임시 파일을 삭제하며 원본은 보존한다.
+    9. [자막변환]/[합치기]/[합치기 테스트] 완료 시 알림 창을 띄운다. 창이
+       전면이 아니면 임시 최상위로 올린 뒤 띄우고 알림 종료 시 원상 복구한다.
+       [중지]로 끝났거나 창을 닫으며 중단된 경우는 띄우지 않는다.
 
 파일명 변환 규칙은 rename.py 의 transform() 이 단일출처다.
 """
@@ -55,6 +58,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenuBar,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
@@ -997,12 +1001,35 @@ class MainWindow(QWidget):
         self._set_busy(True)
         self.worker = Worker("smi", root=root, delete_smi=self.chk_del.isChecked())
         self.worker.line.connect(self.log.appendPlainText)
-        self.worker.done.connect(self._on_smi_done)
+        self.worker.done.connect(lambda _: self._on_task_done("자막변환"))
         self.worker.start()
 
-    def _on_smi_done(self, _: object) -> None:
-        self._invalidate_plan()  # smi 삭제/srt 생성으로 기존 미리보기 계획은 무효
+    def _on_task_done(self, label: str) -> None:
+        cancelled = self.worker is not None and self.worker._cancel
+        self._invalidate_plan()  # 파일 생성/삭제/교체로 기존 미리보기 계획은 무효
         self._set_busy(False)
+        if not cancelled:
+            self._notify_done(label)
+
+    def _notify_done(self, label: str) -> None:
+        """작업 완료 알림. 창이 전면이 아니면 전면으로 올린 뒤 메시지를 띄운다."""
+        if not self.isVisible():
+            return  # 창을 닫으며 중단된 경우 — 알림 생략
+        forced = False
+        if not self.isActiveWindow():
+            # Windows 는 백그라운드 프로세스의 전면 전환을 제한하므로
+            # 임시 최상위 플래그로 강제하고 알림 종료 후 원상 복구한다
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+            if not self.act_topmost.isChecked():
+                self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+                forced = True
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        QMessageBox.information(self, "작업 완료", f"{label} 작업이 끝났다.")
+        if forced:
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+            self.show()
 
     def _start_mux(self, test: bool = False) -> None:
         root = self._get_root()
@@ -1026,7 +1053,8 @@ class MainWindow(QWidget):
                              mux_strip=self.rad_strip.isChecked(), mux_test=test,
                              keep_langs=tuple(langs), jobs=self.spin_jobs.value())
         self.worker.line.connect(self.log.appendPlainText)
-        self.worker.done.connect(self._on_smi_done)  # 동일 처리: 계획 무효 + busy 해제
+        label = "합치기 테스트" if test else "합치기"
+        self.worker.done.connect(lambda _, l=label: self._on_task_done(l))
         self.worker.start()
 
     def _start_apply(self) -> None:
