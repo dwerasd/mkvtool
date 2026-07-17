@@ -26,7 +26,6 @@ from pathlib import Path
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(errors="replace")
 
-MKVMERGE = Path(__file__).resolve().parent / "mkvmerge.exe"
 TMP_SUFFIX = ".delsup.tmp.mkv"
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 FAIL_LIST_MAX = 20  # 텔레그램 메시지에 나열할 실패 파일 상한
@@ -63,6 +62,12 @@ def load_env(path: Path) -> dict[str, str]:
         key, _, value = line.partition("=")
         env[key.strip()] = value.strip().strip("'\"")
     return env
+
+
+# mkvmerge 위치는 .env 의 PATH_MKV_TOOLS 를 따른다(미설정 시 스크립트 폴더)
+MKVMERGE = Path(
+    load_env(ENV_FILE).get("PATH_MKV_TOOLS") or Path(__file__).resolve().parent
+) / "mkvmerge.exe"
 
 
 def format_size(n: float) -> str:
