@@ -21,13 +21,16 @@
          변환하며 합친다(mkv변환+합치기 겸용, 검증 후 원본 컨테이너 제거).
        [자막제거] 자막 트랙만 제거(del_sup.py 와 동일, 용량 절감 보고).
        공통: 임시 파일로 만든 뒤 트랙 구성을 검증하고 원본을 원자 교체한다.
-       목표 상태가 이미 달성된 파일은 스킵한다(재실행 안전). .srt 원본은 남긴다.
+       목표 상태가 이미 달성된 파일은 스킵한다(재실행 안전). .srt 원본은 남긴다
+       (예외: 아래 [추가한 자막파일 삭제]).
        mkvmerge.exe 위치는 .env 의 PATH_MKV_TOOLS 를 따른다(미설정 시 스크립트 폴더).
+       출력 검증은 rc=0(무경고)·크기 정상이면 생략해 대량 배치의 프로브 비용을
+       없앤다(경고·크기 이상·플래그 조작 케이스는 풀 검증 유지).
        [합치기 테스트] — 첫 대상 파일 1개만 같은 모드로 처리해 <이름>.muxtest.mkv 로
        저장한다(원본 유지). 결과 확인 후 이상 없으면 [합치기]로 전체 진행.
-       [동시 작업](1~4) — 전체 실행 시 병렬로 처리할 파일 수. 출력 검증은
-       rc=0(무경고)·크기 정상이면 생략해 대량 배치의 프로브 비용을 없앤다
-       (경고·크기 이상·플래그 조작 케이스는 풀 검증 유지).
+       [추가한 자막파일 삭제] — ko추가 두 모드(기본해제+ko추가/자막제거+ko추가)의
+       [합치기] 전체 실행에서 합치기에 성공한 파일의 .srt 원본을 삭제한다.
+       [합치기 테스트]와 스킵·실패 파일에는 적용하지 않는다.
        [남길 자막](ko/en/und 체크) — 자막제거+ko추가/자막제거 모드에서만 동작.
        선택 언어의 자막은 보존하고 그 외 전부 제거한다. ko 기본트랙 규칙:
        ko 자막이 기본이 아니면 전체 기본 해제 후 ko(2개면 첫번째)를 기본으로,
@@ -68,7 +71,6 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -156,7 +158,7 @@ class Worker(QThread):
                  plan: list[tuple[Path, Path]] | None = None,
                  strip_season: bool = False, delete_smi: bool = False,
                  mux_strip: bool = False, mux_test: bool = False,
-                 keep_langs: tuple[str, ...] = (), jobs: int = 1,
+                 keep_langs: tuple[str, ...] = (), delete_srt: bool = False,
                  find_word: str = "", repl_word: str = "") -> None:
         super().__init__()
         self.mode = mode
@@ -169,7 +171,7 @@ class Worker(QThread):
         self.mux_strip = mux_strip  # True=자막제거+ko추가, False=기본해제+ko추가
         self.mux_test = mux_test    # True=첫 대상 1개만 muxtest 출력, 원본 유지
         self.keep_langs = keep_langs  # 남길 자막 언어(자막제거 계열 모드에서만)
-        self.jobs = max(1, jobs)      # 동시 파일 작업 수(합치기 계열 전체 실행)
+        self.delete_srt = delete_srt  # 합치기 성공 시 합쳐진 .srt 원본 삭제(전체 실행만)
         self._cancel = False
         self._procs: set[subprocess.Popen] = set()  # 실행 중 mkvmerge 핸들
         self._lock = threading.Lock()
@@ -456,38 +458,49 @@ class Worker(QThread):
                 src.unlink()  # 검증 통과한 .mkv 가 자리잡은 뒤 원본 컨테이너 제거
             except OSError as e:
                 lines.append(f"  [경고] {src.name}: 원본 제거 실패 — {e}")
+            note = self._delete_merged_srt(srt, lines)
             lines.append(f"  [완료] {src.name} → {dst.name}: {detail},"
-                         f" ko 자막 추가(기본) ({elapsed})")
+                         f" ko 자막 추가(기본){note} ({elapsed})")
         else:
             tmp.replace(src)
-            lines.append(f"  [완료] {src.name}: {detail}, ko 자막 추가(기본) ({elapsed})")
+            note = self._delete_merged_srt(srt, lines)
+            lines.append(f"  [완료] {src.name}: {detail},"
+                         f" ko 자막 추가(기본){note} ({elapsed})")
         return "done"
 
-    def _iter_results(self, files, one):
-        """파일별 작업을 실행하고 결과를 파일 순서대로 낸다.
+    def _delete_merged_srt(self, srt: Path, lines: list[str]) -> str:
+        """[추가한 자막파일 삭제] 체크 시 합쳐진 .srt 원본을 삭제한다.
 
-        테스트 모드는 순차 실행하며 첫 실제 대상(스킵 아님)에서 중단한다.
-        그 외에는 동시 작업 수(jobs)만큼 병렬 실행한다(로그 순서는 유지).
+        원자 교체가 끝난 뒤에만 호출한다(교체 실패 시 자막 보존).
+        완료 라인에 덧붙일 표기를 반환한다.
         """
-        if self.mux_test or self.jobs <= 1:
-            # 순차 실행: 다음 파일의 프로브를 현재 합치기와 병렬로 선읽기해
-            # 파일 사이의 죽은 시간(NAS 위 MP4 인덱스 읽기 수 초~십수 초)을 없앤다
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                for i, f in enumerate(files):
-                    if self._cancel:
-                        break
-                    if not self.mux_test and i + 1 < len(files):
-                        nxt = files[i + 1]
-                        self._prefetch[str(nxt)] = pool.submit(probe, nxt)
-                    res = one(f)
-                    yield res
-                    if self.mux_test and res[0] != "skip":
-                        break
-        else:
-            with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-                futs = [pool.submit(one, f) for f in files]
-                for fut in futs:
-                    yield fut.result()
+        if not self.delete_srt:
+            return ""
+        try:
+            srt.unlink()
+            return ", srt 삭제"
+        except OSError as e:
+            lines.append(f"  [경고] {srt.name}: 자막파일 삭제 실패 — {e}")
+            return ""
+
+    def _iter_results(self, files, one):
+        """파일별 작업을 순차 실행하고 결과를 파일 순서대로 낸다.
+
+        다음 파일의 프로브를 현재 작업과 병렬로 선읽기해 파일 사이의
+        죽은 시간(NAS 위 MP4 인덱스 읽기 수 초~십수 초)을 없앤다.
+        테스트 모드는 첫 실제 대상(스킵 아님)에서 중단한다.
+        """
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            for i, f in enumerate(files):
+                if self._cancel:
+                    break
+                if not self.mux_test and i + 1 < len(files):
+                    nxt = files[i + 1]
+                    self._prefetch[str(nxt)] = pool.submit(probe, nxt)
+                res = one(f)
+                yield res
+                if self.mux_test and res[0] != "skip":
+                    break
 
     def _mux(self) -> None:
         assert self.root is not None  # mux 모드는 root 필수(타입 내로잉)
@@ -505,13 +518,12 @@ class Worker(QThread):
         if self.mux_strip and self.keep_langs:
             mode += f"(남길: {','.join(self.keep_langs)})"
         tag = " 테스트(1개만, 원본 유지)" if self.mux_test else ""
-        jobs = f" (동시 {self.jobs})" if self.jobs > 1 and not self.mux_test else ""
         started = time.monotonic()
         n_conv = sum(1 for p in files if p.suffix.lower() != ".mkv")
         head = f"MKV {len(files) - n_conv}개"
         if self.mux_strip:
             head += f" + 비-MKV {n_conv}개(mkv 변환 겸)"
-        self.line.emit(f"[자막합치기:{mode}{tag}] {self.root} — {head}{jobs}")
+        self.line.emit(f"[자막합치기:{mode}{tag}] {self.root} — {head}")
         # 같은 스템의 비-MKV 둘(A.mp4+A.ts)이 같은 A.mkv 를 두고 경쟁하지 않도록
         # 배치 내 변환 대상명이 중복되면 뒤의 것을 충돌로 제외한다
         run: list[Path] = []
@@ -669,9 +681,8 @@ class Worker(QThread):
                        and not p.name.endswith(MUX_TEST_SUFFIX))
         tag = " 테스트(1개만, 원본 유지)" if self.mux_test else ""
         keeps = f"(남길: {','.join(self.keep_langs)})" if self.keep_langs else ""
-        jobs = f" (동시 {self.jobs})" if self.jobs > 1 and not self.mux_test else ""
         started = time.monotonic()
-        self.line.emit(f"[자막제거{keeps}{tag}] {self.root} — MKV {len(files)}개{jobs}")
+        self.line.emit(f"[자막제거{keeps}{tag}] {self.root} — MKV {len(files)}개")
         for state, lines, src, out in self._iter_results(files, self._delsub_one):
             for ln in lines:
                 self.line.emit(ln)
@@ -779,9 +790,8 @@ class Worker(QThread):
         files = sorted(p for p in self.root.rglob("*")
                        if p.is_file() and p.suffix.lower() in REMUX_EXTS)
         tag = " 테스트(1개만, 원본 유지)" if self.mux_test else ""
-        jobs = f" (동시 {self.jobs})" if self.jobs > 1 and not self.mux_test else ""
         started = time.monotonic()
-        self.line.emit(f"[mkv변환{tag}] {self.root} — 대상 {len(files)}개{jobs}")
+        self.line.emit(f"[mkv변환{tag}] {self.root} — 대상 {len(files)}개")
         # 같은 스템의 입력 둘(A.mp4+A.avi)이 같은 A.mkv 를 두고 경쟁하지 않도록
         # 배치 내 대상명이 중복되면 뒤의 것을 충돌로 제외한다
         seen: set[str] = set()
@@ -913,12 +923,10 @@ class MainWindow(QWidget):
         self.chk_keep_ko = QCheckBox("ko")
         self.chk_keep_en = QCheckBox("en")
         self.chk_keep_und = QCheckBox("und")
-        # 동시 작업 수: 합치기 계열 전체 실행에서 병렬로 처리할 파일 수
-        self.lbl_jobs = QLabel("동시 작업")
-        self.spin_jobs = QSpinBox()
-        self.spin_jobs.setRange(1, 4)
+        # ko추가 두 모드의 [합치기] 전체 실행에서 합쳐진 .srt 원본을 삭제
+        self.chk_del_srt = QCheckBox("추가한 자막파일 삭제")
         for rad in (self.rad_remux, self.rad_flag, self.rad_strip, self.rad_delsub):
-            rad.toggled.connect(self._update_keep_enabled)
+            rad.toggled.connect(self._update_mode_enabled)
 
         # 파일명 단어변경: 찾을 단어를 바꿀 단어로 치환해 일괄 개명(확장자 제외)
         self.edit_find = QLineEdit()
@@ -967,8 +975,7 @@ class MainWindow(QWidget):
         row3.addWidget(self.chk_keep_en)
         row3.addWidget(self.chk_keep_und)
         row3.addSpacing(24)
-        row3.addWidget(self.lbl_jobs)
-        row3.addWidget(self.spin_jobs)
+        row3.addWidget(self.chk_del_srt)
         row3.addStretch(1)
 
         row4 = QHBoxLayout()
@@ -1005,13 +1012,11 @@ class MainWindow(QWidget):
         {"flag": self.rad_flag, "strip": self.rad_strip,
          "delsub": self.rad_delsub}.get(saved_mode, self.rad_remux).setChecked(True)
         for chk, key in ((self.chk_keep_ko, "keep_ko"), (self.chk_keep_en, "keep_en"),
-                         (self.chk_keep_und, "keep_und")):
+                         (self.chk_keep_und, "keep_und"),
+                         (self.chk_del_srt, "delete_srt")):
             chk.toggled.connect(lambda on, k=key: self.settings.setValue(k, on))
             chk.setChecked(bool(self.settings.value(key, False, type=bool)))
-        self.spin_jobs.valueChanged.connect(
-            lambda v: self.settings.setValue("jobs", v))
-        self.spin_jobs.setValue(int(self.settings.value("jobs", 1, type=int)))
-        self._update_keep_enabled()
+        self._update_mode_enabled()
         if self.settings.value("strip_season", False, type=bool):
             self.strip_season = True
             self.btn_season.setText("시즌제거취소")
@@ -1039,7 +1044,6 @@ class MainWindow(QWidget):
         self.rad_flag.setEnabled(not busy)
         self.rad_strip.setEnabled(not busy)
         self.rad_delsub.setEnabled(not busy)
-        self.spin_jobs.setEnabled(not busy)
         self.path_edit.setEnabled(not busy)
         self.edit_find.setEnabled(not busy)
         self.edit_repl.setEnabled(not busy)
@@ -1048,10 +1052,10 @@ class MainWindow(QWidget):
         if busy:
             self.btn_apply.setEnabled(False)
             for w in (self.lbl_keep, self.chk_keep_ko,
-                      self.chk_keep_en, self.chk_keep_und):
+                      self.chk_keep_en, self.chk_keep_und, self.chk_del_srt):
                 w.setEnabled(False)
         else:
-            self._update_keep_enabled()
+            self._update_mode_enabled()
 
     def _stop_worker(self) -> None:
         """실행 중 작업 중단: 남은 파일 스킵 + 현재 mkvmerge 즉시 종료·정리."""
@@ -1068,12 +1072,15 @@ class MainWindow(QWidget):
             self.worker.wait(10_000)  # 현재 파일 정리(임시 삭제)까지 대기
         event.accept()
 
-    def _update_keep_enabled(self, *_: object) -> None:
-        """남길 자막 체크박스는 자막제거 계열 모드에서만 활성화한다."""
+    def _update_mode_enabled(self, *_: object) -> None:
+        """모드 의존 위젯 활성화: 남길 자막은 자막제거 계열,
+        추가한 자막파일 삭제는 ko추가 두 모드에서만."""
         on = self.rad_strip.isChecked() or self.rad_delsub.isChecked()
         for w in (self.lbl_keep, self.chk_keep_ko,
                   self.chk_keep_en, self.chk_keep_und):
             w.setEnabled(on)
+        self.chk_del_srt.setEnabled(
+            self.rad_flag.isChecked() or self.rad_strip.isChecked())
 
     def _set_topmost(self, on: bool) -> None:
         """항상 위 고정 토글. 플래그 변경 시 창이 숨겨지므로 재표시가 필요하다."""
@@ -1173,9 +1180,11 @@ class MainWindow(QWidget):
                               (self.chk_keep_und, "und")):
                 if chk.isChecked():
                     langs.append(code)
+        # 추가한 자막파일 삭제는 ko추가 두 모드의 전체 실행에서만(테스트 제외)
+        del_srt = mode == "mux" and not test and self.chk_del_srt.isChecked()
         self.worker = Worker(mode, root=root,
                              mux_strip=self.rad_strip.isChecked(), mux_test=test,
-                             keep_langs=tuple(langs), jobs=self.spin_jobs.value())
+                             keep_langs=tuple(langs), delete_srt=del_srt)
         self.worker.line.connect(self.log.appendPlainText)
         label = "합치기 테스트" if test else "합치기"
         self.worker.done.connect(lambda _, l=label: self._on_task_done(l))
