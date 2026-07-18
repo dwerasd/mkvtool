@@ -35,6 +35,11 @@
        선택 언어의 자막은 보존하고 그 외 전부 제거한다. ko 기본트랙 규칙:
        ko 자막이 기본이 아니면 전체 기본 해제 후 ko(2개면 첫번째)를 기본으로,
        ko 가 3개 이상이면 해당 파일은 알리고 진행하지 않는다(보류).
+       [남길 음성](ko/en/ja/und 체크) + [기본 음성](콤보) — 같은 두 모드에서 동작.
+       체크 시 선택 언어의 음성만 남기고 그 외 제거하며, 기본 음성으로 고른
+       언어의 첫 트랙을 기본으로 만든다(그 언어가 없으면 플래그는 건드리지
+       않는다). 남길 음성이 해당 파일에 하나도 없으면 알리고 진행하지 않는다
+       (보류 — 음성 전부 제거 방지). 체크가 없으면 음성은 건드리지 않는다.
     7. 옵션(최상위/시즌제거/원본제거 체크/합치기 모드)·마지막 사용 경로·
        창 위치/크기는 QSettings 로 영속되어 재실행 시 복원된다.
     8. [중지] 버튼(실행 중에만 활성) 또는 창 닫기(X)는 작업을 즉시 중단한다:
@@ -62,6 +67,7 @@ from PySide6.QtGui import QAction, QCloseEvent, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -138,14 +144,17 @@ def is_ko(track: dict) -> bool:
         str(p.get("language_ietf", "")).startswith("ko")
 
 
-def sub_lang(track: dict) -> str:
-    """자막 트랙 언어를 2자 코드로 정규화한다(kor→ko, eng→en, 미지정→und)."""
+_LANG_MAP = {"kor": "ko", "eng": "en", "jpn": "ja"}
+
+
+def track_lang(track: dict) -> str:
+    """트랙 언어를 2자 코드로 정규화한다(kor→ko, eng→en, jpn→ja, 미지정→und)."""
     p = track.get("properties", {})
     ietf = str(p.get("language_ietf") or "").split("-")[0].lower()
     if ietf:
-        return {"kor": "ko", "eng": "en"}.get(ietf, ietf)
+        return _LANG_MAP.get(ietf, ietf)
     lang = str(p.get("language") or "und").lower()
-    return {"kor": "ko", "eng": "en"}.get(lang, lang)
+    return _LANG_MAP.get(lang, lang)
 
 
 class Worker(QThread):
@@ -159,6 +168,7 @@ class Worker(QThread):
                  strip_season: bool = False, delete_smi: bool = False,
                  mux_strip: bool = False, mux_test: bool = False,
                  keep_langs: tuple[str, ...] = (), delete_srt: bool = False,
+                 audio_langs: tuple[str, ...] = (), audio_default: str = "ko",
                  find_word: str = "", repl_word: str = "") -> None:
         super().__init__()
         self.mode = mode
@@ -171,6 +181,8 @@ class Worker(QThread):
         self.mux_strip = mux_strip  # True=자막제거+ko추가, False=기본해제+ko추가
         self.mux_test = mux_test    # True=첫 대상 1개만 muxtest 출력, 원본 유지
         self.keep_langs = keep_langs  # 남길 자막 언어(자막제거 계열 모드에서만)
+        self.audio_langs = audio_langs      # 남길 음성 언어(빈 튜플 = 음성 불간섭)
+        self.audio_default = audio_default  # 남길 음성 활성 시 기본 트랙으로 만들 언어
         self.delete_srt = delete_srt  # 합치기 성공 시 합쳐진 .srt 원본 삭제(전체 실행만)
         self._cancel = False
         self._procs: set[subprocess.Popen] = set()  # 실행 중 mkvmerge 핸들
@@ -323,6 +335,40 @@ class Worker(QThread):
         tail = f" / 원본제거 {deleted}" if self.delete_smi else ""
         self.line.emit(f"\n[요약] 변환 {done} / 스킵(srt존재) {skipped} / 실패 {failed}{tail}")
 
+    def _audio_plan(self, tracks: list[dict], lines: list[str],
+                    name: str) -> tuple[list[dict], dict | None, bool] | None:
+        """남길 음성 계획: (남길 트랙, 기본 트랙, 변경 필요 여부)를 반환한다.
+
+        미체크 시 전체 유지·변경 없음. 체크했는데 남길 트랙이 하나도 없으면
+        None(보류 — 음성 전부 제거는 파일을 망가뜨린다). 기본 트랙은 선택
+        언어의 첫 트랙, 그 언어가 없으면 None(플래그 불간섭).
+        """
+        audio = [t for t in tracks if t.get("type") == "audio"]
+        if not self.audio_langs:
+            return audio, None, False
+        keep = [t for t in audio if track_lang(t) in self.audio_langs]
+        if audio and not keep:
+            lines.append(f"  [보류] {name}: 남길 음성에 해당하는 트랙 없음 —"
+                         f" 진행하지 않음")
+            return None
+        cand = [t for t in keep if track_lang(t) == self.audio_default]
+        chosen = cand[0] if cand else None
+        defaults = [t for t in keep if t.get("properties", {}).get("default_track")]
+        changed = len(keep) != len(audio) or \
+            (chosen is not None and defaults != [chosen])
+        return keep, chosen, changed
+
+    def _audio_args(self, keep: list[dict], chosen: dict | None) -> list[str]:
+        """남길 음성 mkvmerge 인자. 비활성(미체크)·음성 없는 파일이면 빈 리스트."""
+        if not self.audio_langs or not keep:
+            return []
+        args = ["--audio-tracks", ",".join(str(t["id"]) for t in keep)]
+        if chosen is not None:
+            for t in keep:
+                args += ["--default-track-flag",
+                         f"{t['id']}:{1 if t is chosen else 0}"]
+        return args
+
     def _mux_one(self, src: Path) -> tuple[str, list[str]]:
         """단일 영상에 ko 자막을 합친다. (상태, 로그라인) 반환 — 병렬 실행 안전.
 
@@ -365,21 +411,25 @@ class Worker(QThread):
         # 남길 자막(자막제거+ko추가 모드에서만): 선택 언어 자막은 보존
         keep: list[dict] = []
         if self.mux_strip and self.keep_langs:
-            keep = [t for t in subs if sub_lang(t) in self.keep_langs]
-            ko_kept = [t for t in keep if sub_lang(t) == "ko"]
+            keep = [t for t in subs if track_lang(t) in self.keep_langs]
+            ko_kept = [t for t in keep if track_lang(t) == "ko"]
             if len(ko_kept) >= 3:
                 lines.append(f"  [보류] {src.name}: ko 자막 {len(ko_kept)}개 —"
                              f" 수동 확인 필요, 진행하지 않음")
                 return "skip"
+        ap = self._audio_plan(tracks, lines, src.name)
+        if ap is None:
+            return "skip"
+        keep_audio, chosen_audio, audio_changed = ap
         # 목표 상태 달성 시 스킵(비-MKV 는 컨테이너 변환이 남아 항상 진행):
         # 옵션1 은 ko 기본 존재, 옵션2 는 ko 기본 단독
         # (남길 자막 지정 시: ko 기본 존재 + 모든 자막이 남길 언어(∪ko) 안)
-        if ko_default and not remux:
+        if ko_default and not remux and not audio_changed:
             if not self.mux_strip:
                 lines.append(f"  [스킵] {src.name}: 이미 ko 기본 자막 있음")
                 return "skip"
             allowed = set(self.keep_langs) | {"ko"}
-            if (self.keep_langs and all(sub_lang(t) in allowed for t in subs)) \
+            if (self.keep_langs and all(track_lang(t) in allowed for t in subs)) \
                     or (not self.keep_langs and len(subs) == 1):
                 lines.append(f"  [스킵] {src.name}: 이미 ko 기본 자막 있음")
                 return "skip"
@@ -398,6 +448,7 @@ class Worker(QThread):
         else:
             for t in subs:
                 cmd += ["--default-track-flag", f"{t['id']}:0"]
+        cmd += self._audio_args(keep_audio, chosen_audio)
         cmd += [str(src), "--language", "0:ko", "--default-track-flag", "0:1", str(srt)]
         proc = self._run_mkvmerge(cmd)
         if self._cancel:
@@ -412,9 +463,10 @@ class Worker(QThread):
                 tmp.unlink()
             return "fail"
 
-        # 출력 검증은 의심 경로에서만: rc=1(경고) 또는 출력 크기 이상 시 풀 검증.
+        # 출력 검증은 의심 경로에서만: rc=1(경고)·크기 이상·음성 트랙 조작 시 풀 검증.
         # rc=0 + 크기 정상은 신뢰한다(수백~수천 파일 배치의 프로브 비용 절감).
-        if proc.returncode != 0 or tmp.stat().st_size < src.stat().st_size * 0.5:
+        if proc.returncode != 0 or self.audio_langs \
+                or tmp.stat().st_size < src.stat().st_size * 0.5:
             out = probe(tmp)
             ok = False
             if out is not None:
@@ -426,11 +478,19 @@ class Worker(QThread):
                              if not is_ko(t)
                              and t.get("properties", {}).get("default_track")]
                 expected_subs = (len(keep) + 1) if self.mux_strip else len(subs) + 1
+                oaudio = [t for t in ot if t.get("type") == "audio"]
+                aflags_ok = True
+                if chosen_audio is not None:
+                    adefs = [t for t in oaudio
+                             if t.get("properties", {}).get("default_track")]
+                    aflags_ok = len(adefs) == 1 and \
+                        track_lang(adefs[0]) == self.audio_default
                 ok = (
                     sum(1 for t in ot if t.get("type") == "video") == n_video
-                    and sum(1 for t in ot if t.get("type") == "audio") == n_audio
+                    and len(oaudio) == len(keep_audio)
                     and len(osubs) == expected_subs
                     and len(ko_def) == 1 and not other_def
+                    and aflags_ok
                 )
             if not ok:
                 lines.append(f"  [검증실패] {src.name}: 원본 보존, 임시 파일 삭제")
@@ -444,6 +504,10 @@ class Worker(QThread):
                 detail = "기존 자막 제거" if subs else "기존 자막 없음"
         else:
             detail = f"기존 자막 {len(subs)}개 기본해제"
+        if self.audio_langs:
+            detail += f", 음성 {n_audio - len(keep_audio)}개 제거·{len(keep_audio)}개 유지"
+            if chosen_audio is not None:
+                detail += f"(기본: {self.audio_default})"
         elapsed = format_elapsed(time.monotonic() - t0)
         if self.mux_test:
             dst_test = src.with_name(src.stem + MUX_TEST_SUFFIX)
@@ -517,6 +581,9 @@ class Worker(QThread):
         mode = "자막제거+ko추가" if self.mux_strip else "기본해제+ko추가"
         if self.mux_strip and self.keep_langs:
             mode += f"(남길: {','.join(self.keep_langs)})"
+        if self.audio_langs:
+            mode += (f"(남길 음성: {','.join(self.audio_langs)}"
+                     f"·기본 {self.audio_default})")
         tag = " 테스트(1개만, 원본 유지)" if self.mux_test else ""
         started = time.monotonic()
         n_conv = sum(1 for p in files if p.suffix.lower() != ".mkv")
@@ -580,20 +647,25 @@ class Worker(QThread):
         subs = [t for t in tracks if t.get("type") == "subtitles"]
         n_video = sum(1 for t in tracks if t.get("type") == "video")
         n_audio = sum(1 for t in tracks if t.get("type") == "audio")
-        if not subs:
+        ap = self._audio_plan(tracks, lines, mkv.name)
+        if ap is None:
+            return "hold", 0, 0
+        keep_audio, chosen_audio, audio_changed = ap
+        if not subs and not audio_changed:
             if not self.mux_test:
                 lines.append(f"  [스킵] {mkv.name}: 자막 없음")
             return "skip", 0, 0
         # 남길 자막: 선택 언어 보존 + ko 기본트랙 규칙(2개→첫번째, 3개↑→보류)
-        keep = ([t for t in subs if sub_lang(t) in self.keep_langs]
+        keep = ([t for t in subs if track_lang(t) in self.keep_langs]
                 if self.keep_langs else [])
-        ko_kept = [t for t in keep if sub_lang(t) == "ko"]
+        ko_kept = [t for t in keep if track_lang(t) == "ko"]
         if len(ko_kept) >= 3:
             lines.append(f"  [보류] {mkv.name}: ko 자막 {len(ko_kept)}개 —"
                          f" 수동 확인 필요, 진행하지 않음")
             return "hold", 0, 0
         chosen = ko_kept[0] if ko_kept else None
-        if len(keep) == len(subs):  # 제거할 자막 없음 — 기본 플래그만 점검
+        if len(keep) == len(subs) and not audio_changed:
+            # 제거할 자막·음성 변경 없음 — 자막 기본 플래그만 점검
             defaults = [t for t in subs
                         if t.get("properties", {}).get("default_track")]
             if chosen is None or defaults == [chosen]:
@@ -612,6 +684,7 @@ class Worker(QThread):
                             f"{t['id']}:{1 if t is chosen else 0}"]
         else:
             cmd += ["--no-subtitles"]
+        cmd += self._audio_args(keep_audio, chosen_audio)
         cmd.append(str(mkv))
         proc = self._run_mkvmerge(cmd)
         if self._cancel:
@@ -625,8 +698,8 @@ class Worker(QThread):
             if tmp.exists():
                 tmp.unlink()
             return "fail", 0, 0
-        # 검증은 의심 경로에서만: rc=1(경고)·크기 이상·플래그를 조작한 keep 케이스
-        if proc.returncode != 0 or keep \
+        # 검증은 의심 경로에서만: rc=1(경고)·크기 이상·트랙/플래그 조작 케이스
+        if proc.returncode != 0 or keep or self.audio_langs \
                 or tmp.stat().st_size < mkv.stat().st_size * 0.5:
             out = probe(tmp)
             ok = False
@@ -637,12 +710,19 @@ class Worker(QThread):
                 if chosen is not None:
                     defs = [t for t in osubs
                             if t.get("properties", {}).get("default_track")]
-                    flags_ok = len(defs) == 1 and sub_lang(defs[0]) == "ko"
+                    flags_ok = len(defs) == 1 and track_lang(defs[0]) == "ko"
+                oaudio = [t for t in ot if t.get("type") == "audio"]
+                aflags_ok = True
+                if chosen_audio is not None:
+                    adefs = [t for t in oaudio
+                             if t.get("properties", {}).get("default_track")]
+                    aflags_ok = len(adefs) == 1 and \
+                        track_lang(adefs[0]) == self.audio_default
                 ok = (
                     len(osubs) == len(keep)
                     and sum(1 for t in ot if t.get("type") == "video") == n_video
-                    and sum(1 for t in ot if t.get("type") == "audio") == n_audio
-                    and flags_ok
+                    and len(oaudio) == len(keep_audio)
+                    and flags_ok and aflags_ok
                 )
             if not ok:
                 lines.append(f"  [검증실패] {mkv.name}: 원본 보존, 임시 파일 삭제")
@@ -653,6 +733,10 @@ class Worker(QThread):
             detail += f"·{len(keep)}개 유지"
             if chosen is not None:
                 detail += "(기본: ko)"
+        if self.audio_langs:
+            detail += f", 음성 {n_audio - len(keep_audio)}개 제거·{len(keep_audio)}개 유지"
+            if chosen_audio is not None:
+                detail += f"(기본: {self.audio_default})"
         elapsed = format_elapsed(time.monotonic() - t0)
         if self.mux_test:
             dst_path = mkv.with_name(mkv.stem + MUX_TEST_SUFFIX)
@@ -681,6 +765,9 @@ class Worker(QThread):
                        and not p.name.endswith(MUX_TEST_SUFFIX))
         tag = " 테스트(1개만, 원본 유지)" if self.mux_test else ""
         keeps = f"(남길: {','.join(self.keep_langs)})" if self.keep_langs else ""
+        if self.audio_langs:
+            keeps += (f"(남길 음성: {','.join(self.audio_langs)}"
+                      f"·기본 {self.audio_default})")
         started = time.monotonic()
         self.line.emit(f"[자막제거{keeps}{tag}] {self.root} — MKV {len(files)}개")
         for state, lines, src, out in self._iter_results(files, self._delsub_one):
@@ -923,6 +1010,15 @@ class MainWindow(QWidget):
         self.chk_keep_ko = QCheckBox("ko")
         self.chk_keep_en = QCheckBox("en")
         self.chk_keep_und = QCheckBox("und")
+        # 남길 음성(자막제거 계열 모드 전용) + 기본 트랙으로 만들 언어 선택
+        self.lbl_keep_a = QLabel("남길 음성")
+        self.chk_akeep_ko = QCheckBox("ko")
+        self.chk_akeep_en = QCheckBox("en")
+        self.chk_akeep_ja = QCheckBox("ja")
+        self.chk_akeep_und = QCheckBox("und")
+        self.lbl_adef = QLabel("기본 음성")
+        self.cmb_adef = QComboBox()
+        self.cmb_adef.addItems(["ko", "en", "ja", "und"])
         # ko추가 두 모드의 [합치기] 전체 실행에서 합쳐진 .srt 원본을 삭제
         self.chk_del_srt = QCheckBox("추가한 자막파일 삭제")
         for rad in (self.rad_remux, self.rad_flag, self.rad_strip, self.rad_delsub):
@@ -978,6 +1074,17 @@ class MainWindow(QWidget):
         row3.addWidget(self.chk_del_srt)
         row3.addStretch(1)
 
+        row3a = QHBoxLayout()
+        row3a.addWidget(self.lbl_keep_a)
+        row3a.addWidget(self.chk_akeep_ko)
+        row3a.addWidget(self.chk_akeep_en)
+        row3a.addWidget(self.chk_akeep_ja)
+        row3a.addWidget(self.chk_akeep_und)
+        row3a.addSpacing(24)
+        row3a.addWidget(self.lbl_adef)
+        row3a.addWidget(self.cmb_adef)
+        row3a.addStretch(1)
+
         row4 = QHBoxLayout()
         row4.addWidget(self.edit_find, 1)
         row4.addWidget(self.edit_repl, 1)
@@ -988,6 +1095,7 @@ class MainWindow(QWidget):
         root_layout.addLayout(top)
         root_layout.addLayout(row2)
         root_layout.addLayout(row3)
+        root_layout.addLayout(row3a)
         root_layout.addLayout(row4)
         root_layout.addWidget(self.log, 1)
 
@@ -1013,9 +1121,15 @@ class MainWindow(QWidget):
          "delsub": self.rad_delsub}.get(saved_mode, self.rad_remux).setChecked(True)
         for chk, key in ((self.chk_keep_ko, "keep_ko"), (self.chk_keep_en, "keep_en"),
                          (self.chk_keep_und, "keep_und"),
+                         (self.chk_akeep_ko, "akeep_ko"), (self.chk_akeep_en, "akeep_en"),
+                         (self.chk_akeep_ja, "akeep_ja"), (self.chk_akeep_und, "akeep_und"),
                          (self.chk_del_srt, "delete_srt")):
             chk.toggled.connect(lambda on, k=key: self.settings.setValue(k, on))
             chk.setChecked(bool(self.settings.value(key, False, type=bool)))
+        self.cmb_adef.currentTextChanged.connect(
+            lambda v: self.settings.setValue("audio_default", v))
+        self.cmb_adef.setCurrentText(
+            str(self.settings.value("audio_default", "ko", type=str)))
         self._update_mode_enabled()
         if self.settings.value("strip_season", False, type=bool):
             self.strip_season = True
@@ -1052,7 +1166,10 @@ class MainWindow(QWidget):
         if busy:
             self.btn_apply.setEnabled(False)
             for w in (self.lbl_keep, self.chk_keep_ko,
-                      self.chk_keep_en, self.chk_keep_und, self.chk_del_srt):
+                      self.chk_keep_en, self.chk_keep_und, self.chk_del_srt,
+                      self.lbl_keep_a, self.chk_akeep_ko, self.chk_akeep_en,
+                      self.chk_akeep_ja, self.chk_akeep_und,
+                      self.lbl_adef, self.cmb_adef):
                 w.setEnabled(False)
         else:
             self._update_mode_enabled()
@@ -1073,11 +1190,14 @@ class MainWindow(QWidget):
         event.accept()
 
     def _update_mode_enabled(self, *_: object) -> None:
-        """모드 의존 위젯 활성화: 남길 자막은 자막제거 계열,
+        """모드 의존 위젯 활성화: 남길 자막·남길 음성·기본 음성은 자막제거 계열,
         추가한 자막파일 삭제는 ko추가 두 모드에서만."""
         on = self.rad_strip.isChecked() or self.rad_delsub.isChecked()
         for w in (self.lbl_keep, self.chk_keep_ko,
-                  self.chk_keep_en, self.chk_keep_und):
+                  self.chk_keep_en, self.chk_keep_und,
+                  self.lbl_keep_a, self.chk_akeep_ko, self.chk_akeep_en,
+                  self.chk_akeep_ja, self.chk_akeep_und,
+                  self.lbl_adef, self.cmb_adef):
             w.setEnabled(on)
         self.chk_del_srt.setEnabled(
             self.rad_flag.isChecked() or self.rad_strip.isChecked())
@@ -1175,16 +1295,23 @@ class MainWindow(QWidget):
         else:
             mode = "mux"
         langs: list[str] = []
+        alangs: list[str] = []
         if self.rad_strip.isChecked() or self.rad_delsub.isChecked():
             for chk, code in ((self.chk_keep_ko, "ko"), (self.chk_keep_en, "en"),
                               (self.chk_keep_und, "und")):
                 if chk.isChecked():
                     langs.append(code)
+            for chk, code in ((self.chk_akeep_ko, "ko"), (self.chk_akeep_en, "en"),
+                              (self.chk_akeep_ja, "ja"), (self.chk_akeep_und, "und")):
+                if chk.isChecked():
+                    alangs.append(code)
         # 추가한 자막파일 삭제는 ko추가 두 모드의 전체 실행에서만(테스트 제외)
         del_srt = mode == "mux" and not test and self.chk_del_srt.isChecked()
         self.worker = Worker(mode, root=root,
                              mux_strip=self.rad_strip.isChecked(), mux_test=test,
-                             keep_langs=tuple(langs), delete_srt=del_srt)
+                             keep_langs=tuple(langs), delete_srt=del_srt,
+                             audio_langs=tuple(alangs),
+                             audio_default=self.cmb_adef.currentText())
         self.worker.line.connect(self.log.appendPlainText)
         label = "합치기 테스트" if test else "합치기"
         self.worker.done.connect(lambda _, l=label: self._on_task_done(l))
