@@ -39,6 +39,9 @@
     9. [자막변환]/[합치기]/[합치기 테스트] 완료 시 알림 창을 띄운다. 창이
        전면이 아니면 임시 최상위로 올린 뒤 띄우고 알림 종료 시 원상 복구한다.
        [중지]로 끝났거나 창을 닫으며 중단된 경우는 띄우지 않는다.
+    10. [단어변경] — 입력칸 2개(찾을 단어/바꿀 단어)와 [변경] 버튼. 경로 아래
+        모든 파일명(확장자 제외)에서 찾을 단어를 바꿀 단어로 치환해 즉시
+        개명한다. 바꿀 단어가 비어 있으면 제거. 대상명 충돌·빈 이름은 건너뛴다.
 
 파일명 변환 규칙은 rename.py 의 transform() 이 단일출처다.
 """
@@ -153,13 +156,16 @@ class Worker(QThread):
                  plan: list[tuple[Path, Path]] | None = None,
                  strip_season: bool = False, delete_smi: bool = False,
                  mux_strip: bool = False, mux_test: bool = False,
-                 keep_langs: tuple[str, ...] = (), jobs: int = 1) -> None:
+                 keep_langs: tuple[str, ...] = (), jobs: int = 1,
+                 find_word: str = "", repl_word: str = "") -> None:
         super().__init__()
         self.mode = mode
         self.root = root
         self.plan = plan or []
         self.strip_season = strip_season
         self.delete_smi = delete_smi
+        self.find_word = find_word  # 단어변경 모드: 파일명에서 찾을 단어
+        self.repl_word = repl_word  # 단어변경 모드: 바꿀 단어(빈 문자열 = 제거)
         self.mux_strip = mux_strip  # True=자막제거+ko추가, False=기본해제+ko추가
         self.mux_test = mux_test    # True=첫 대상 1개만 muxtest 출력, 원본 유지
         self.keep_langs = keep_langs  # 남길 자막 언어(자막제거 계열 모드에서만)
@@ -220,6 +226,9 @@ class Worker(QThread):
                 self.done.emit(None)
             elif self.mode == "remux":
                 self._remux()
+                self.done.emit(None)
+            elif self.mode == "replace":
+                self._replace()
                 self.done.emit(None)
             else:
                 self._apply()
@@ -809,6 +818,42 @@ class Worker(QThread):
         if self.mux_test and done:
             self.line.emit("결과(.muxtest.mkv) 확인 후 이상 없으면 [합치기]로 전체 진행.")
 
+    def _replace(self) -> None:
+        """경로 아래 모든 파일명(확장자 제외)에서 찾을 단어를 바꿀 단어로 치환한다."""
+        assert self.root is not None  # replace 모드는 root 필수(타입 내로잉)
+        ok = conflict = fail = 0
+        files = sorted(p for p in self.root.rglob("*") if p.is_file())
+        self.line.emit(f"[단어변경] {self.root} — "
+                       f"'{self.find_word}' → '{self.repl_word}' (파일 {len(files)}개)")
+        planned: set[str] = set()  # 이번 실행에서 예약된 대상명(내부 충돌 감지)
+        for p in files:
+            if self._cancel:
+                break
+            if self.find_word not in p.stem:
+                continue
+            new_stem = p.stem.replace(self.find_word, self.repl_word)
+            if not new_stem:
+                conflict += 1
+                self.line.emit(f"  [스킵] {p.name}: 결과 이름이 빈 문자열")
+                continue
+            target = p.with_name(new_stem + p.suffix)
+            if target.name == p.name:
+                continue
+            occupied = target.exists() and target.name.lower() != p.name.lower()
+            if occupied or str(target).lower() in planned:
+                conflict += 1
+                self.line.emit(f"  [충돌] {p.name} → {target.name}: 대상 파일이 이미 존재")
+                continue
+            planned.add(str(target).lower())
+            try:
+                p.rename(target)
+                ok += 1
+                self.line.emit(f"  [완료] {p.name}\n      → {target.name}")
+            except OSError as e:
+                fail += 1
+                self.line.emit(f"  [실패] {p.name}: {e}")
+        self.line.emit(f"\n[요약] 완료 {ok} / 충돌·스킵 {conflict} / 실패 {fail}")
+
     def _apply(self) -> None:
         ok = fail = 0
         for src, dst in self.plan:
@@ -875,6 +920,14 @@ class MainWindow(QWidget):
         for rad in (self.rad_remux, self.rad_flag, self.rad_strip, self.rad_delsub):
             rad.toggled.connect(self._update_keep_enabled)
 
+        # 파일명 단어변경: 찾을 단어를 바꿀 단어로 치환해 일괄 개명(확장자 제외)
+        self.edit_find = QLineEdit()
+        self.edit_find.setPlaceholderText("찾을 단어 (예: .DVDRip)")
+        self.edit_repl = QLineEdit()
+        self.edit_repl.setPlaceholderText("바꿀 단어 (비우면 제거)")
+        self.btn_replace = QPushButton("변경")
+        self.btn_replace.clicked.connect(self._start_replace)
+
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
@@ -918,11 +971,17 @@ class MainWindow(QWidget):
         row3.addWidget(self.spin_jobs)
         row3.addStretch(1)
 
+        row4 = QHBoxLayout()
+        row4.addWidget(self.edit_find, 1)
+        row4.addWidget(self.edit_repl, 1)
+        row4.addWidget(self.btn_replace)
+
         root_layout = QVBoxLayout(self)
         root_layout.setMenuBar(menubar)
         root_layout.addLayout(top)
         root_layout.addLayout(row2)
         root_layout.addLayout(row3)
+        root_layout.addLayout(row4)
         root_layout.addWidget(self.log, 1)
 
         # 경로가 바뀌면 이전 미리보기 결과는 무효 — 재스캔 강제
@@ -982,6 +1041,9 @@ class MainWindow(QWidget):
         self.rad_delsub.setEnabled(not busy)
         self.spin_jobs.setEnabled(not busy)
         self.path_edit.setEnabled(not busy)
+        self.edit_find.setEnabled(not busy)
+        self.edit_repl.setEnabled(not busy)
+        self.btn_replace.setEnabled(not busy)
         self.btn_stop.setEnabled(busy)
         if busy:
             self.btn_apply.setEnabled(False)
@@ -1118,6 +1180,27 @@ class MainWindow(QWidget):
         label = "합치기 테스트" if test else "합치기"
         self.worker.done.connect(lambda _, l=label: self._on_task_done(l))
         self.worker.start()
+
+    def _start_replace(self) -> None:
+        """경로 아래 모든 파일명에서 찾을 단어를 바꿀 단어로 치환한다(확장자 제외)."""
+        root = self._get_root()
+        if root is None:
+            return
+        find = self.edit_find.text()
+        if not find:
+            self.log.setPlainText("[오류] 찾을 단어를 입력하라")
+            return
+        self.log.clear()
+        self._set_busy(True)
+        self.worker = Worker("replace", root=root,
+                             find_word=find, repl_word=self.edit_repl.text())
+        self.worker.line.connect(self.log.appendPlainText)
+        self.worker.done.connect(self._on_replace_done)
+        self.worker.start()
+
+    def _on_replace_done(self, _: object) -> None:
+        self._invalidate_plan()  # 파일명 변경으로 기존 미리보기 계획은 무효
+        self._set_busy(False)
 
     def _start_apply(self) -> None:
         self.log.appendPlainText("\n[적용 시작]")
